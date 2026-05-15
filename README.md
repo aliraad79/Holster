@@ -177,5 +177,5 @@ The `integration/integration_test.go` runs this exact flow end-to-end as a race-
 Built and maintained by **Ali Ahmadi** — senior software engineer focused on fintech infrastructure and low-latency systems in Go.
 
 - GitHub: [@aliraad79](https://github.com/aliraad79)
-- Email: [dev@raastin.com](mailto:dev@raastin.com)
+- Email: [a.ahmadi.k.79@gmail.com](mailto:a.ahmadi.k.79@gmail.com)
 - Companion repo: [Gun](https://github.com/aliraad79/Gun) (the matching engine Holster pairs with)
