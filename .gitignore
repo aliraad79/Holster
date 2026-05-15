@@ -1,0 +1,5 @@
+*.wal
+data/
+bench/results-*.txt
+.idea/
+.vscode/
