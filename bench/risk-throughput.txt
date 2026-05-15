@@ -1,0 +1,7 @@
+goos: linux
+goarch: amd64
+pkg: github.com/aliraad79/Holster/integration
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H
+BenchmarkRisk_HoldThroughput-16    	  278026	      8133 ns/op
+PASS
+ok  	github.com/aliraad79/Holster/integration	2.398s

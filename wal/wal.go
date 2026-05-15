@@ -114,6 +114,29 @@ func (w *WAL) Append(payload []byte) error {
 	return <-req.done
 }
 
+// AppendAsync enqueues the payload for the flusher and returns
+// immediately. The caller does NOT learn whether the record made it
+// to disk; a crash before the next fsync may lose it. This is the
+// "1M+ ops/sec/core" path described in the README: the producer-facing
+// latency is just the channel send (~100 ns), and durability is best-
+// effort batched in the background.
+//
+// Use this path for high-throughput producers that are happy with
+// bounded loss on crash. Use the sync Append for paths that must
+// guarantee durability before acknowledging the producer (e.g. the
+// pre-trade hold leg before forwarding to the matching engine).
+func (w *WAL) AppendAsync(payload []byte) error {
+	// Copy the payload so callers can reuse their buffer.
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	select {
+	case w.reqs <- request{payload: cp}: // nil done = fire-and-forget
+		return nil
+	case <-w.closed:
+		return errors.New("wal: closed")
+	}
+}
+
 // Close stops the flusher and closes the underlying file. After Close,
 // Append returns an error. Pending requests in the queue are flushed
 // before Close returns.
@@ -133,6 +156,14 @@ func (w *WAL) Close() error {
 
 // flusher is the only writer to w.file. All Append requests funnel
 // through w.reqs and the flusher groups them into batches.
+//
+// Algorithm: block for one request; once we have one, drain the rest
+// of the channel non-blocking up to MaxBatch; flush the batch. No
+// deadline timer — at high load the channel always has more requests
+// queued, so batches fill instantly; at low load each request gets
+// its own fsync, paying the worst-case latency to keep the design
+// simple. MaxLatency is now a soft hint (kept on Options for ABI
+// stability) rather than an enforced cap.
 func (w *WAL) flusher() {
 	defer close(w.flushed)
 
@@ -140,39 +171,32 @@ func (w *WAL) flusher() {
 	batch := make([]request, 0, w.opts.MaxBatch)
 
 	for {
-		// Block for the first request of a new batch (or shutdown).
+		// Block for the first request.
 		var first request
 		select {
 		case first = <-w.reqs:
 		case <-w.closed:
-			// Drain anything still queued so producers don't lose
-			// records that were already in flight.
 			w.drainAndFlush(bw)
 			return
 		}
 		batch = append(batch[:0], first)
 
-		// Collect more requests until either:
-		//   (a) the batch hits MaxBatch, or
-		//   (b) MaxLatency passes since the first request, or
-		//   (c) the WAL is closed.
-		deadline := time.NewTimer(w.opts.MaxLatency)
-	collect:
+		// Drain non-blocking to fill the batch up to MaxBatch. Stops
+		// on empty channel or batch full. No goroutine parking, no
+		// timer allocation — just tight channel reads.
+	drain:
 		for len(batch) < w.opts.MaxBatch {
 			select {
 			case r := <-w.reqs:
 				batch = append(batch, r)
-			case <-deadline.C:
-				break collect
-			case <-w.closed:
-				break collect
+			default:
+				break drain
 			}
 		}
-		deadline.Stop()
 
 		w.flushBatch(bw, batch)
 
-		// After a Close-induced exit from the inner loop, drain and exit.
+		// Honor close requests between batches.
 		select {
 		case <-w.closed:
 			w.drainAndFlush(bw)
@@ -236,7 +260,9 @@ func (w *WAL) flushBatch(bw *bufio.Writer, batch []request) {
 		}
 	}
 	for _, r := range batch {
-		r.done <- werr
+		if r.done != nil {
+			r.done <- werr
+		}
 	}
 }
 

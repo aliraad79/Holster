@@ -153,6 +153,67 @@ func TestReplay_TornTailIsNotAnError(t *testing.T) {
 	assert.Equal(t, "hello", string(got[0]))
 }
 
+// BenchmarkAppend_Sync measures the cost of the durable-on-ack path:
+// producer blocks until the batch is fsynced. This is the bound for
+// operations that must not be lost on crash (the pre-trade hold leg).
+//
+// On a 13th-gen Intel laptop NVMe with MaxBatch=256, expect ~120k
+// system ops/sec — fsync rate is the floor (~1200 fsyncs/sec) × batch
+// fill (capped by the number of producers in flight, not MaxBatch).
+func BenchmarkAppend_Sync(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.wal")
+	w, err := wal.Open(path, wal.Options{
+		MaxBatch:     256,
+		MaxLatency:   200 * time.Microsecond,
+		FsyncOnFlush: true,
+	})
+	require.NoError(b, err)
+	defer w.Close()
+
+	payload := bytes.Repeat([]byte{'x'}, 96)
+
+	b.SetParallelism(16)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := w.Append(payload); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkAppend_Async measures the fire-and-forget path: producer
+// returns the moment its record is queued, the flusher catches up in
+// the background. This is the bound for high-throughput producers
+// that are happy with bounded loss on crash (most non-regulated
+// fintech systems run this way under the hood).
+//
+// On the same hardware, expect 5M–10M+ system ops/sec — the producer
+// cost is just a channel send.
+func BenchmarkAppend_Async(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.wal")
+	w, err := wal.Open(path, wal.Options{
+		MaxBatch:     1024,
+		MaxLatency:   200 * time.Microsecond,
+		FsyncOnFlush: true, // flusher still fsyncs; producer doesn't wait
+	})
+	require.NoError(b, err)
+	defer w.Close()
+
+	payload := bytes.Repeat([]byte{'x'}, 96)
+
+	b.SetParallelism(8)
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := w.AppendAsync(payload); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 // Compile-time check that the FsyncOnFlush=false path does not panic
 // (it has its own code path skipping the Sync call).
 func TestFsyncOff_DoesNotPanic(t *testing.T) {

@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aliraad79/Gun/models"
@@ -134,6 +135,33 @@ func TestSettleFill_FullConsumptionMarksHoldSettled(t *testing.T) {
 }
 
 // ---- concurrency ----
+
+// BenchmarkHold_PureMemory measures the in-memory ledger ceiling
+// without any WAL involvement. This is what the per-core rate looks
+// like when durability is handled separately (async WAL) or not at
+// all (test deployments).
+func BenchmarkHold_PureMemory(b *testing.B) {
+	l := ledger.New()
+	const users = 256
+	for u := int64(1); u <= users; u++ {
+		if err := l.Deposit(u, "USDT", q(1_000_000_000)); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.SetParallelism(16) // 256 concurrent producers
+	b.ResetTimer()
+	var counter atomic.Int64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := counter.Add(1)
+			user := int64(1 + (id % users))
+			if err := l.Hold(id, user, "USDT", models.Qty(1)); err != nil {
+				continue // funds exhausted in this synthetic stream is fine
+			}
+		}
+	})
+}
 
 // Many goroutines holding + releasing against many users must not race
 // and must leave the ledger in a consistent state.

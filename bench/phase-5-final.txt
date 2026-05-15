@@ -1,0 +1,27 @@
+PASS
+ok  	github.com/aliraad79/Holster/clearing	0.006s
+goos: linux
+goarch: amd64
+pkg: github.com/aliraad79/Holster/integration
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H
+BenchmarkRisk_HoldThroughput-16          	  308862	      6693 ns/op
+BenchmarkClearing_SettleThroughput-16    	   20904	    104081 ns/op
+PASS
+ok  	github.com/aliraad79/Holster/integration	8.038s
+goos: linux
+goarch: amd64
+pkg: github.com/aliraad79/Holster/ledger
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H
+BenchmarkHold_PureMemory-16    	 2546320	       948.2 ns/op
+PASS
+ok  	github.com/aliraad79/Holster/ledger	3.400s
+PASS
+ok  	github.com/aliraad79/Holster/risk	0.006s
+goos: linux
+goarch: amd64
+pkg: github.com/aliraad79/Holster/wal
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H
+BenchmarkAppend_Sync-16     	  352652	      8716 ns/op
+BenchmarkAppend_Async-16    	 2166415	      1112 ns/op
+PASS
+ok  	github.com/aliraad79/Holster/wal	6.738s
