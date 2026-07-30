@@ -15,6 +15,8 @@ var (
 	ErrUnknownAccount    = errors.New("ledger: unknown account")
 	ErrNegativeAmount    = errors.New("ledger: amount must be positive")
 	ErrAlreadySettled    = errors.New("ledger: hold already consumed")
+	ErrFillExceedsHold   = errors.New("ledger: fill exceeds remaining hold")
+	ErrHoldIDCollision   = errors.New("ledger: hold orderID collision with different params")
 )
 
 // numShards is a power of two so the (user_id & mask) shard lookup is
@@ -163,38 +165,40 @@ func (l *Ledger) Withdraw(userID int64, asset string, amount models.Qty) error {
 //
 // Idempotency: a second Hold call with the same orderID is a no-op
 // returning nil. (Producers retry on timeout; we must not double-hold.)
+// That guarantee holds under concurrent retries, not just sequential
+// ones: the duplicate check and the reservation happen under one
+// acquisition of holdsMu.
 func (l *Ledger) Hold(orderID int64, userID int64, asset string, amount models.Qty) error {
 	if !amount.IsPositive() {
 		return ErrNegativeAmount
 	}
 
-	l.holdsMu.RLock()
+	// Lock order: holdsMu, then the shard. See the package doc.
+	l.holdsMu.Lock()
+	defer l.holdsMu.Unlock()
+
 	if existing, ok := l.holds[orderID]; ok && existing.State == holdActive {
-		l.holdsMu.RUnlock()
 		// idempotent: same hold already exists
 		if existing.UserID == userID && existing.Asset == asset && existing.Amount.Eq(amount) {
 			return nil
 		}
-		return errors.New("ledger: hold orderID collision with different params")
+		return ErrHoldIDCollision
 	}
-	l.holdsMu.RUnlock()
 
 	s := l.shardFor(userID)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	acc, ok := l.lookup(s, userID, asset)
 	if !ok || acc.Available().Lt(amount) {
-		s.mu.Unlock()
 		return ErrInsufficientFunds
 	}
 	acc.Held = acc.Held.Add(amount)
 	acc.Version++
-	s.mu.Unlock()
 
-	l.holdsMu.Lock()
 	l.holds[orderID] = &holdRecord{
 		UserID: userID, Asset: asset, Amount: amount, State: holdActive,
 	}
-	l.holdsMu.Unlock()
 	return nil
 }
 
@@ -205,27 +209,29 @@ func (l *Ledger) Hold(orderID int64, userID int64, asset string, amount models.Q
 // returns nil (no-op). Releasing an unknown orderID returns
 // ErrHoldNotFound.
 func (l *Ledger) Release(orderID int64) error {
+	// Lock order: holdsMu, then the shard. Both are held across the
+	// whole release so no observer can see the hold marked released
+	// while the funds are still counted as Held.
 	l.holdsMu.Lock()
+	defer l.holdsMu.Unlock()
+
 	h, ok := l.holds[orderID]
 	if !ok {
-		l.holdsMu.Unlock()
 		return ErrHoldNotFound
 	}
 	if h.State != holdActive {
-		l.holdsMu.Unlock()
 		return nil // idempotent no-op
 	}
 	h.State = holdReleased
-	l.holdsMu.Unlock()
 
 	s := l.shardFor(h.UserID)
 	s.mu.Lock()
-	acc, ok := l.lookup(s, h.UserID, h.Asset)
-	if ok {
+	defer s.mu.Unlock()
+
+	if acc, ok := l.lookup(s, h.UserID, h.Asset); ok {
 		acc.Held = acc.Held.Sub(h.Amount)
 		acc.Version++
 	}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -237,14 +243,23 @@ func (l *Ledger) Release(orderID int64) error {
 // A SettleFill against an unknown order returns ErrHoldNotFound (the
 // risk service should have created the hold before the order reached
 // the engine).
+//
+// The hold is a spending limit, so the whole call is atomic: validating
+// that the hold still covers fillAmount, moving the funds, and consuming
+// that much of the hold all happen under one acquisition of holdsMu.
+// Splitting the check from the decrement is a double spend — concurrent
+// callers all read the same pre-decrement remainder, all conclude there
+// is room, and all proceed.
 func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string, fillAmount models.Qty) error {
 	if !fillAmount.IsPositive() {
 		return ErrNegativeAmount
 	}
 
-	l.holdsMu.RLock()
+	// Lock order: holdsMu, then shard locks. See the package doc.
+	l.holdsMu.Lock()
+	defer l.holdsMu.Unlock()
+
 	h, ok := l.holds[orderID]
-	l.holdsMu.RUnlock()
 	if !ok {
 		return ErrHoldNotFound
 	}
@@ -254,7 +269,7 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 		return ErrAlreadySettled
 	}
 	if fillAmount.Gt(h.Amount) {
-		return errors.New("ledger: fill exceeds remaining hold")
+		return ErrFillExceedsHold
 	}
 
 	// Two-account update touching holder's shard and taker's shard.
@@ -265,10 +280,12 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 	takerShard := l.shardFor(takerUserID)
 
 	unlock := l.lockShardPair(h.UserID, takerUserID)
+	defer unlock()
 
 	holderAcc, _ := l.lookup(holderShard, h.UserID, h.Asset)
 	if holderAcc == nil {
-		unlock()
+		// Nothing has been consumed yet, so returning here leaves the
+		// hold exactly as it was.
 		return ErrUnknownAccount
 	}
 	takerAcc := l.getOrCreate(takerShard, takerUserID, takerAsset)
@@ -285,16 +302,12 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 	takerAcc.Balance = takerAcc.Balance.Add(fillAmount)
 	takerAcc.Version++
 
-	unlock()
-
-	// Decrement the hold's remaining amount. If it goes to zero, mark
-	// the hold settled so Release on it is a no-op.
-	l.holdsMu.Lock()
+	// Consume that much of the hold. If it goes to zero, mark the hold
+	// settled so Release on it is a no-op.
 	h.Amount = h.Amount.Sub(fillAmount)
 	if h.Amount.IsZero() {
 		h.State = holdSettled
 	}
-	l.holdsMu.Unlock()
 	return nil
 }
 

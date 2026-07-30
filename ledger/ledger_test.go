@@ -220,6 +220,80 @@ func TestSettleFill_LocksShardsInIndexOrderNotUserIDOrder(t *testing.T) {
 	}
 }
 
+// A hold is a spending limit, so concurrency must not let callers spend
+// past it. Fire many small settles at one hold from many goroutines and
+// assert the ledger never hands out more than the hold was worth.
+//
+// This is the money invariant: sum(successful fills) <= hold amount.
+func TestSettleFill_ConcurrentSettlesCannotOverConsumeHold(t *testing.T) {
+	const (
+		holdUnits = 100
+		attempts  = 200 // deliberately more than the hold can cover
+	)
+
+	l := ledger.New()
+	require.NoError(t, l.Deposit(1, "USDT", q(1000)))
+	require.NoError(t, l.Hold(100, 1, "USDT", q(holdUnits)))
+
+	var okCount atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			defer wg.Done()
+			<-start // release all goroutines at once to maximize overlap
+			if err := l.SettleFill(100, 2, "USDT", q(1)); err == nil {
+				okCount.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.LessOrEqual(t, okCount.Load(), int64(holdUnits),
+		"more settles succeeded than the hold could cover — double spend")
+	assert.True(t, l.Balance(2, "USDT").Lte(q(holdUnits)),
+		"counterparty received %s against a %d-unit hold",
+		l.Balance(2, "USDT"), holdUnits)
+	assert.True(t, l.HeldOf(1, "USDT").Gte(models.ZeroQty),
+		"holder's held went negative: %s", l.HeldOf(1, "USDT"))
+	assert.True(t, l.Balance(1, "USDT").Gte(models.ZeroQty),
+		"holder's balance went negative: %s", l.Balance(1, "USDT"))
+
+	// Conservation: whatever left the holder must have arrived at the
+	// counterparty, and nothing may be conjured.
+	assert.Equal(t, q(1000).Sub(l.Balance(1, "USDT")), l.Balance(2, "USDT"),
+		"funds were created or destroyed")
+}
+
+// Hold is documented as idempotent on orderID because producers retry on
+// timeout. Concurrent retries of the *same* hold must reserve the funds
+// once, not once per caller.
+func TestHold_ConcurrentDuplicateIDsDoNotDoubleHold(t *testing.T) {
+	const callers = 64
+
+	l := ledger.New()
+	require.NoError(t, l.Deposit(1, "USDT", q(1000)))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = l.Hold(7, 1, "USDT", q(10))
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, q(10), l.HeldOf(1, "USDT"),
+		"%d concurrent retries of one hold reserved funds more than once", callers)
+	assert.Equal(t, q(10), l.HoldOutstanding(7))
+}
+
 // Many goroutines holding + releasing against many users must not race
 // and must leave the ledger in a consistent state.
 func TestConcurrent_HoldsAndReleasesAreSafe(t *testing.T) {
