@@ -120,8 +120,8 @@ func BenchmarkClearing_SettleThroughput(b *testing.B) {
 	totalPairs := 200_000
 	pairs := make([]pair, totalPairs)
 	for i := 0; i < totalPairs; i++ {
-		buyer := int64(1 + (i%users))
-		seller := int64(1 + ((i+1)%users))
+		buyer := int64(1 + (i % users))
+		seller := int64(1 + ((i + 1) % users))
 		buyOrderID := int64(10_000_000 + 2*i)
 		sellOrderID := int64(10_000_000 + 2*i + 1)
 		require(l.Hold(buyOrderID, buyer, "USDT", models.Qty(100*1_0000_0000)))

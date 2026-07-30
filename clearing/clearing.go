@@ -42,9 +42,9 @@ type Clearing struct {
 	wal    *wal.WAL
 	holds  HoldLookup
 
-	mu         sync.Mutex
-	lastSeq    map[string]uint64    // per-symbol high-water mark
-	processed  map[string]struct{}  // idempotency key = symbol + "/" + seq
+	mu        sync.Mutex
+	lastSeq   map[string]uint64   // per-symbol high-water mark
+	processed map[string]struct{} // idempotency key = symbol + "/" + seq
 }
 
 // New returns a Clearing service. ledger, wal, and holds are all

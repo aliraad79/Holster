@@ -61,7 +61,7 @@ const (
 type walRecord struct {
 	Kind    recordKind `json:"kind"`
 	OrderID int64      `json:"order_id"`
-	UserID  int64     `json:"user_id,omitempty"`
+	UserID  int64      `json:"user_id,omitempty"`
 	Asset   string     `json:"asset,omitempty"`
 	Amount  models.Qty `json:"amount,omitempty"`
 }

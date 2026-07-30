@@ -53,8 +53,8 @@ type WAL struct {
 	path string
 	opts Options
 
-	mu     sync.Mutex // guards close + file rotation only (NOT writes; those go through reqs)
-	file   *os.File
+	mu   sync.Mutex // guards close + file rotation only (NOT writes; those go through reqs)
+	file *os.File
 
 	reqs    chan request
 	closed  chan struct{}
@@ -313,4 +313,3 @@ func Replay(path string, fn func(payload []byte) error) error {
 		}
 	}
 }
-

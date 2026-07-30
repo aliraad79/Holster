@@ -41,16 +41,16 @@ import (
 // by the in-memory ledger as it mutates account state and queued onto
 // the persister's input channel.
 type Entry struct {
-	UserID     int64
-	Asset      string
-	Delta      models.Qty
-	HeldDelta  models.Qty
-	Kind       string // 'hold' | 'release' | 'settle' | 'deposit' | 'withdraw'
-	RefKind    string // 'order' | 'trade' | 'deposit_id' | ''
-	RefID      int64
-	EngineSeq  uint64 // 0 if not a trade settlement
-	Symbol     string // BTC_USDT etc; "" for non-symbol ops
-	Timestamp  time.Time
+	UserID    int64
+	Asset     string
+	Delta     models.Qty
+	HeldDelta models.Qty
+	Kind      string // 'hold' | 'release' | 'settle' | 'deposit' | 'withdraw'
+	RefKind   string // 'order' | 'trade' | 'deposit_id' | ''
+	RefID     int64
+	EngineSeq uint64 // 0 if not a trade settlement
+	Symbol    string // BTC_USDT etc; "" for non-symbol ops
+	Timestamp time.Time
 }
 
 // TradeRow mirrors the `trades` table row produced by clearing.
