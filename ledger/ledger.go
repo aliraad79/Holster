@@ -88,6 +88,30 @@ func New() *Ledger {
 	return l
 }
 
+// IsEmpty reports whether the ledger holds no accounts and no holds.
+// The recovery replayer uses this as a guard: replaying a log into a
+// ledger that already reflects it double-applies every record, and
+// SettleFill in particular is not idempotent.
+func (l *Ledger) IsEmpty() bool {
+	for _, s := range l.shards {
+		s.mu.RLock()
+		n := len(s.accounts)
+		s.mu.RUnlock()
+		if n != 0 {
+			return false
+		}
+	}
+	for _, hs := range l.holdShards {
+		hs.mu.RLock()
+		n := len(hs.holds)
+		hs.mu.RUnlock()
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // shardIndexFor returns the index of the shard owning the given user.
 // Pure function of user_id. Note that this mapping is NOT order
 // preserving: userID 265 lands on a lower shard index than userID 10.

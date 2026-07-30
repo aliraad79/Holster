@@ -62,8 +62,14 @@ func New(l *ledger.Ledger, w *wal.WAL, holds HoldLookup) *Clearing {
 	}
 }
 
+// KindTrade tags this package's WAL records. risk and funding write
+// their own kinds to the same stream; the recovery package dispatches on
+// this field, so it must be present on every record written here.
+const KindTrade = "trade"
+
 // tradeRecord is the WAL payload written for each settled match.
 type tradeRecord struct {
+	Kind         string     `json:"kind"`
 	Seq          uint64     `json:"seq"`
 	Symbol       string     `json:"symbol"`
 	BuyOrderID   int64      `json:"buy_order_id"`
@@ -111,11 +117,18 @@ func (c *Clearing) Settle(symbol string, m models.Match) error {
 		return fmt.Errorf("clearing: %w", err)
 	}
 
-	// WAL the trade first (write-ahead). If we crash between WAL and
-	// the ledger ops, replay re-runs both SettleFill calls. They are
-	// idempotent on (orderID, seq) so the redo is harmless.
+	// WAL the trade first (write-ahead), so a crash between here and the
+	// ledger ops replays as a completed settlement.
+	//
+	// Note what this does NOT rely on: SettleFill is not idempotent. It
+	// takes no seq and decrements the hold on every call, so re-applying
+	// a trade record on top of an already-settled ledger double-spends
+	// the hold. Recovery is therefore a full rebuild from an empty
+	// ledger over the whole ordered stream, never a partial redo against
+	// live state. See the recovery package.
 	rec := tradeRecord{
-		Seq: m.Seq, Symbol: symbol,
+		Kind: KindTrade,
+		Seq:  m.Seq, Symbol: symbol,
 		BuyOrderID: m.BuyId, SellOrderID: m.SellId,
 		BuyerUserID: buyerUser, SellerUserID: sellerUser,
 		Price: m.Price, Volume: m.Volume, QuoteAmount: quoteAmount,
@@ -156,6 +169,13 @@ func (c *Clearing) LastSeq(symbol string) uint64 {
 }
 
 // ---- helpers ----
+
+// SplitSymbol parses BASE_QUOTE like "BTC_USDT" -> ("BTC", "USDT").
+// Exported so the recovery replayer derives the same assets from a trade
+// record that Settle derived when it wrote the record.
+func SplitSymbol(s string) (base, quote string, err error) {
+	return splitSymbol(s)
+}
 
 func splitSymbol(s string) (base, quote string, err error) {
 	i := strings.IndexByte(s, '_')

@@ -33,10 +33,18 @@ type Options struct {
 	// (the first append in a batch waits longer) for throughput.
 	MaxBatch int
 
-	// MaxLatency is the longest a single Append will wait before the
-	// flusher gives up on filling the batch and fsyncs what it has.
-	// Default 1ms if zero. Lower values protect tail latency at low
-	// load; higher values give better throughput under saturation.
+	// MaxLatency is currently UNUSED and setting it has no effect.
+	//
+	// It described a deadline the flusher would wait to fill a batch, but
+	// the flusher has no timer: it blocks for one request, drains whatever
+	// else is already queued, and flushes. At low load that means one
+	// fsync per append; at high load the channel is never empty so batches
+	// fill without needing a deadline.
+	//
+	// Kept so existing call sites still compile. Do not read it as a
+	// tuning knob.
+	//
+	// Deprecated: has no effect; will be removed.
 	MaxLatency time.Duration
 
 	// FsyncOnFlush forces fsync after each batch write. Default true.

@@ -53,9 +53,17 @@ func New(l *ledger.Ledger, w *wal.WAL) *Risk {
 // recordKind discriminates HOLD vs RELEASE WAL records.
 type recordKind string
 
+// Record kinds written by this package. Exported because risk shares one
+// ordered WAL with funding and clearing, and the recovery replayer
+// dispatches on this field.
 const (
-	recHold    recordKind = "hold"
-	recRelease recordKind = "release"
+	KindHold    = "hold"
+	KindRelease = "release"
+)
+
+const (
+	recHold    recordKind = KindHold
+	recRelease recordKind = KindRelease
 )
 
 type walRecord struct {
