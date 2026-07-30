@@ -26,6 +26,14 @@ var (
 const numShards = 256
 const shardMask = numShards - 1
 
+// Holds are sharded too, keyed on order_id rather than user_id. A single
+// lock over the holds map would serialize Hold/Release/SettleFill across
+// every order in the system, which makes the account sharding above
+// pointless: each of those calls takes the holds lock, so the holds lock
+// is the real throughput ceiling.
+const numHoldShards = 256
+const holdShardMask = numHoldShards - 1
+
 // shard holds one slice of users plus its mutex.
 type shard struct {
 	mu       sync.RWMutex
@@ -44,6 +52,15 @@ type holdRecord struct {
 	State  holdState
 }
 
+// holdShard is one slice of the order_id -> hold map plus its lock. A
+// call only ever touches the single shard owning its order_id, so no two
+// hold shards are ever held at once and they cannot deadlock against each
+// other.
+type holdShard struct {
+	mu    sync.RWMutex
+	holds map[int64]*holdRecord
+}
+
 type holdState uint8
 
 const (
@@ -55,19 +72,18 @@ const (
 // Ledger is the public face of the in-memory hot ledger. Safe for
 // concurrent use across goroutines.
 type Ledger struct {
-	shards [numShards]*shard
-
-	holdsMu sync.RWMutex
-	holds   map[int64]*holdRecord // order_id -> hold record
+	shards     [numShards]*shard
+	holdShards [numHoldShards]*holdShard
 }
 
 // New returns a freshly initialized ledger.
 func New() *Ledger {
-	l := &Ledger{
-		holds: make(map[int64]*holdRecord, 1<<14),
-	}
+	l := &Ledger{}
 	for i := range l.shards {
 		l.shards[i] = &shard{accounts: make(map[int64]map[string]*Account)}
+	}
+	for i := range l.holdShards {
+		l.holdShards[i] = &holdShard{holds: make(map[int64]*holdRecord, 64)}
 	}
 	return l
 }
@@ -85,6 +101,12 @@ func shardIndexFor(userID int64) int {
 // user_id; never blocks.
 func (l *Ledger) shardFor(userID int64) *shard {
 	return l.shards[shardIndexFor(userID)]
+}
+
+// holdShardFor returns the shard owning the given order's hold record.
+// Pure function of order_id; never blocks.
+func (l *Ledger) holdShardFor(orderID int64) *holdShard {
+	return l.holdShards[orderID&holdShardMask]
 }
 
 // lockShardPair write-locks the shards owning userA and userB in
@@ -167,17 +189,18 @@ func (l *Ledger) Withdraw(userID int64, asset string, amount models.Qty) error {
 // returning nil. (Producers retry on timeout; we must not double-hold.)
 // That guarantee holds under concurrent retries, not just sequential
 // ones: the duplicate check and the reservation happen under one
-// acquisition of holdsMu.
+// acquisition of the order's hold-shard lock.
 func (l *Ledger) Hold(orderID int64, userID int64, asset string, amount models.Qty) error {
 	if !amount.IsPositive() {
 		return ErrNegativeAmount
 	}
 
-	// Lock order: holdsMu, then the shard. See the package doc.
-	l.holdsMu.Lock()
-	defer l.holdsMu.Unlock()
+	// Lock order: hold shard, then account shard. See the package doc.
+	hs := l.holdShardFor(orderID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 
-	if existing, ok := l.holds[orderID]; ok && existing.State == holdActive {
+	if existing, ok := hs.holds[orderID]; ok && existing.State == holdActive {
 		// idempotent: same hold already exists
 		if existing.UserID == userID && existing.Asset == asset && existing.Amount.Eq(amount) {
 			return nil
@@ -196,7 +219,7 @@ func (l *Ledger) Hold(orderID int64, userID int64, asset string, amount models.Q
 	acc.Held = acc.Held.Add(amount)
 	acc.Version++
 
-	l.holds[orderID] = &holdRecord{
+	hs.holds[orderID] = &holdRecord{
 		UserID: userID, Asset: asset, Amount: amount, State: holdActive,
 	}
 	return nil
@@ -209,13 +232,14 @@ func (l *Ledger) Hold(orderID int64, userID int64, asset string, amount models.Q
 // returns nil (no-op). Releasing an unknown orderID returns
 // ErrHoldNotFound.
 func (l *Ledger) Release(orderID int64) error {
-	// Lock order: holdsMu, then the shard. Both are held across the
-	// whole release so no observer can see the hold marked released
+	// Lock order: hold shard, then account shard. Both are held across
+	// the whole release so no observer can see the hold marked released
 	// while the funds are still counted as Held.
-	l.holdsMu.Lock()
-	defer l.holdsMu.Unlock()
+	hs := l.holdShardFor(orderID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 
-	h, ok := l.holds[orderID]
+	h, ok := hs.holds[orderID]
 	if !ok {
 		return ErrHoldNotFound
 	}
@@ -246,7 +270,8 @@ func (l *Ledger) Release(orderID int64) error {
 //
 // The hold is a spending limit, so the whole call is atomic: validating
 // that the hold still covers fillAmount, moving the funds, and consuming
-// that much of the hold all happen under one acquisition of holdsMu.
+// that much of the hold all happen under one acquisition of the order's
+// hold-shard lock.
 // Splitting the check from the decrement is a double spend — concurrent
 // callers all read the same pre-decrement remainder, all conclude there
 // is room, and all proceed.
@@ -255,11 +280,12 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 		return ErrNegativeAmount
 	}
 
-	// Lock order: holdsMu, then shard locks. See the package doc.
-	l.holdsMu.Lock()
-	defer l.holdsMu.Unlock()
+	// Lock order: hold shard, then account shards. See the package doc.
+	hs := l.holdShardFor(orderID)
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
 
-	h, ok := l.holds[orderID]
+	h, ok := hs.holds[orderID]
 	if !ok {
 		return ErrHoldNotFound
 	}
@@ -335,9 +361,10 @@ func (l *Ledger) HeldOf(userID int64, asset string) models.Qty {
 // HoldOutstanding returns the remaining (unsettled) amount on a hold,
 // or zero if the hold is unknown / released / settled.
 func (l *Ledger) HoldOutstanding(orderID int64) models.Qty {
-	l.holdsMu.RLock()
-	defer l.holdsMu.RUnlock()
-	if h, ok := l.holds[orderID]; ok && h.State == holdActive {
+	hs := l.holdShardFor(orderID)
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+	if h, ok := hs.holds[orderID]; ok && h.State == holdActive {
 		return h.Amount
 	}
 	return models.ZeroQty
@@ -351,9 +378,10 @@ func (l *Ledger) HoldOutstanding(orderID int64) models.Qty {
 // orderID before the hold is exhausted; SettleFill itself enforces
 // the not-yet-settled invariant.
 func (l *Ledger) HoldOwner(orderID int64) (userID int64, asset string, ok bool) {
-	l.holdsMu.RLock()
-	defer l.holdsMu.RUnlock()
-	h, ok := l.holds[orderID]
+	hs := l.holdShardFor(orderID)
+	hs.mu.RLock()
+	defer hs.mu.RUnlock()
+	h, ok := hs.holds[orderID]
 	if !ok {
 		return 0, "", false
 	}

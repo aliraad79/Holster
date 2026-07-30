@@ -3,31 +3,36 @@
 // the source of truth in flight (the Postgres layer is rebuilt async
 // from the WAL and is source of truth at rest).
 //
-// Concurrency: the ledger is sharded by user_id with one sync.RWMutex
-// per shard. A single user's ops serialize against that user's shard;
-// independent users run in parallel. Separately, one holdsMu guards the
-// order_id -> hold map.
+// Concurrency: there are two independent sets of shards, each entry with
+// its own sync.RWMutex. Accounts are sharded by user_id, holds by
+// order_id. A single user's ops serialize against that user's shard;
+// independent users run in parallel. Likewise for holds per order.
 //
-// Two lock-ordering rules keep this deadlock-free, and both matter:
+// Three lock-ordering rules keep this deadlock-free, and all three
+// matter:
 //
-//  1. holdsMu is always acquired BEFORE any shard lock, never after.
-//     Deposit, Withdraw and the balance queries take only a shard lock;
-//     Hold, Release and SettleFill take holdsMu and then a shard lock.
-//     Nothing may acquire them in the opposite order.
+//  1. A hold shard is always acquired BEFORE any account shard, never
+//     after. Deposit, Withdraw and the balance queries take only an
+//     account shard; Hold, Release and SettleFill take a hold shard and
+//     then account shards. Nothing may acquire them in the opposite
+//     order.
 //
-//  2. When a settlement needs two shards it takes them in ascending
-//     shard-index order. Ordering by user id is NOT sufficient: user ->
-//     shard is userID & shardMask, which is not monotonic, so two
-//     settlements over different user pairs can want the same two
-//     shards in opposite order. See lockShardPair.
+//  2. No two hold shards are ever held at once. Every hold-lifecycle
+//     call touches exactly one order_id, so hold shards cannot deadlock
+//     against each other. A future operation spanning two holds must
+//     order them by shard index, per rule 3.
 //
-// A hold is a spending limit, so the hold-lifecycle operations run
-// wholly under holdsMu rather than checking the hold and then mutating
-// it: an interleaving between those two steps lets concurrent callers
-// spend the same headroom twice. This makes holdsMu a global
-// serialization point for Hold/Release/SettleFill, which is a known
-// throughput ceiling — sharding the holds map by order_id is the way
-// out, but correctness comes first.
+//  3. When a settlement needs two account shards it takes them in
+//     ascending shard-index order. Ordering by user id is NOT
+//     sufficient: user -> shard is userID & shardMask, which is not
+//     monotonic, so two settlements over different user pairs can want
+//     the same two shards in opposite order. See lockShardPair.
+//
+// A hold is a spending limit, so each hold-lifecycle operation runs
+// wholly under its hold-shard lock rather than checking the hold and
+// then mutating it. An interleaving between those two steps lets
+// concurrent callers spend the same headroom twice — 200 concurrent
+// one-unit settles once drained a hundred-unit hold completely.
 package ledger
 
 import (
