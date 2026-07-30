@@ -6,8 +6,10 @@
 // Concurrency: the ledger is sharded by user_id with one sync.RWMutex
 // per shard. A single user's ops serialize against that user's shard;
 // independent users run in parallel. Settlement between two users
-// acquires both shard locks in user_id order so two settlements that
-// touch the same pair can't deadlock.
+// acquires both shard locks in ascending shard-index order so no pair
+// of concurrent settlements can build a lock cycle. Ordering by user id
+// would not be enough — user -> shard is userID & shardMask, which is
+// not monotonic. See lockShardPair.
 package ledger
 
 import (

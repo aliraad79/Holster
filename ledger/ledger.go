@@ -36,10 +36,10 @@ type shard struct {
 // get GC'd by a periodic sweep (out of scope for this revision —
 // for now the map grows; in production we GC).
 type holdRecord struct {
-	UserID   int64
-	Asset    string
-	Amount   models.Qty
-	State    holdState
+	UserID int64
+	Asset  string
+	Amount models.Qty
+	State  holdState
 }
 
 type holdState uint8
@@ -70,10 +70,50 @@ func New() *Ledger {
 	return l
 }
 
+// shardIndexFor returns the index of the shard owning the given user.
+// Pure function of user_id. Note that this mapping is NOT order
+// preserving: userID 265 lands on a lower shard index than userID 10.
+// Anything that needs a deadlock-free ordering over shards must compare
+// these indexes, never the user ids themselves. See lockShardPair.
+func shardIndexFor(userID int64) int {
+	return int(userID & shardMask)
+}
+
 // shardFor returns the shard owning the given user. Pure function of
 // user_id; never blocks.
 func (l *Ledger) shardFor(userID int64) *shard {
-	return l.shards[userID&shardMask]
+	return l.shards[shardIndexFor(userID)]
+}
+
+// lockShardPair write-locks the shards owning userA and userB in
+// ascending *shard index* order and returns the matching unlock func.
+// When both users live on the same shard it locks once.
+//
+// Ordering by shard index is what actually breaks the deadlock cycle.
+// Ordering by user id does not: user -> shard is userID & shardMask,
+// which is not monotonic, so two settlements over different user pairs
+// can ask for the same two shards in opposite order. Concretely,
+// (holder 10, taker 265) wants shards 10 then 9, while (holder 9,
+// taker 266) wants shards 9 then 10 — a textbook AB-BA deadlock that
+// user-id ordering happily walks into.
+func (l *Ledger) lockShardPair(userA, userB int64) (unlock func()) {
+	ia, ib := shardIndexFor(userA), shardIndexFor(userB)
+	if ia > ib {
+		ia, ib = ib, ia
+	}
+
+	first := l.shards[ia]
+	first.mu.Lock()
+	if ia == ib {
+		return first.mu.Unlock
+	}
+
+	second := l.shards[ib]
+	second.mu.Lock()
+	return func() {
+		second.mu.Unlock()
+		first.mu.Unlock()
+	}
 }
 
 // Deposit credits an account. Used by the deposit-confirmation pipeline
@@ -218,27 +258,17 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 	}
 
 	// Two-account update touching holder's shard and taker's shard.
-	// Lock order = ascending user_id to avoid deadlocks when concurrent
-	// settlements touch the same pair in opposite directions. When
-	// both users live on the same shard we only lock once.
+	// Lock order = ascending shard index so concurrent settlements can
+	// never build an AB-BA cycle. When both users live on the same shard
+	// we only lock once. See lockShardPair.
 	holderShard := l.shardFor(h.UserID)
 	takerShard := l.shardFor(takerUserID)
 
-	firstShard, secondShard := holderShard, takerShard
-	if h.UserID > takerUserID {
-		firstShard, secondShard = takerShard, holderShard
-	}
-	firstShard.mu.Lock()
-	if firstShard != secondShard {
-		secondShard.mu.Lock()
-	}
+	unlock := l.lockShardPair(h.UserID, takerUserID)
 
 	holderAcc, _ := l.lookup(holderShard, h.UserID, h.Asset)
 	if holderAcc == nil {
-		if firstShard != secondShard {
-			secondShard.mu.Unlock()
-		}
-		firstShard.mu.Unlock()
+		unlock()
 		return ErrUnknownAccount
 	}
 	takerAcc := l.getOrCreate(takerShard, takerUserID, takerAsset)
@@ -255,10 +285,7 @@ func (l *Ledger) SettleFill(orderID int64, takerUserID int64, takerAsset string,
 	takerAcc.Balance = takerAcc.Balance.Add(fillAmount)
 	takerAcc.Version++
 
-	if firstShard != secondShard {
-		secondShard.mu.Unlock()
-	}
-	firstShard.mu.Unlock()
+	unlock()
 
 	// Decrement the hold's remaining amount. If it goes to zero, mark
 	// the hold settled so Release on it is a no-op.
@@ -344,4 +371,3 @@ func (l *Ledger) getOrCreate(s *shard, userID int64, asset string) *Account {
 	}
 	return acc
 }
-

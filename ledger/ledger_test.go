@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aliraad79/Gun/models"
 	"github.com/aliraad79/Holster/ledger"
@@ -161,6 +162,62 @@ func BenchmarkHold_PureMemory(b *testing.B) {
 			}
 		}
 	})
+}
+
+// Regression: SettleFill must order its two shard locks by shard index,
+// not by user id. The user -> shard mapping is userID & shardMask, which
+// is not monotonic, so user-id ordering can hand two concurrent
+// settlements the same two shards in opposite order.
+//
+// The pairing below is chosen so that ordering by user id deadlocks:
+//
+//	shard(10)  = 10   shard(265) = 9   -> user-id order wants 10 then 9
+//	shard(9)   =  9   shard(266) = 10  -> user-id order wants  9 then 10
+//
+// With shard-index ordering both settlements take shard 9 before shard
+// 10 and the cycle cannot form. A regression here hangs rather than
+// fails, so the work runs under a watchdog.
+func TestSettleFill_LocksShardsInIndexOrderNotUserIDOrder(t *testing.T) {
+	require.Equal(t, 10, 10&255, "test pairing assumes 256 shards")
+	require.Equal(t, 9, 265&255, "test pairing assumes 256 shards")
+	require.Equal(t, 9, 9&255, "test pairing assumes 256 shards")
+	require.Equal(t, 10, 266&255, "test pairing assumes 256 shards")
+
+	const iterations = 20_000
+
+	l := ledger.New()
+	for _, u := range []int64{9, 10, 265, 266} {
+		require.NoError(t, l.Deposit(u, "USDT", q(1_000_000)))
+	}
+	require.NoError(t, l.Hold(1, 10, "USDT", q(500_000)))
+	require.NoError(t, l.Hold(2, 9, "USDT", q(500_000)))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// holder 10 pays taker 265: shards {10, 9}
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = l.SettleFill(1, 265, "USDT", q(1))
+		}
+	}()
+	// holder 9 pays taker 266: shards {9, 10}, opposite user-id order
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = l.SettleFill(2, 266, "USDT", q(1))
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("deadlock: concurrent SettleFill calls acquired the same two " +
+			"shards in opposite order; lock ordering must be by shard index")
+	}
 }
 
 // Many goroutines holding + releasing against many users must not race
