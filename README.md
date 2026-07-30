@@ -2,6 +2,7 @@
 
 > The clearing and wallet companion to [Gun](https://github.com/aliraad79/Gun) — what holds the funds while the gun fires.
 
+[![CI](https://github.com/aliraad79/Holster/actions/workflows/ci.yml/badge.svg)](https://github.com/aliraad79/Holster/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 Holster owns everything Gun deliberately doesn't:
@@ -268,8 +269,12 @@ to everything.
 Before submitting code:
 
 ```bash
-go test -race ./... && go vet ./...
+go test -race ./... && go vet ./... && gofmt -l .
 ```
+
+CI runs the same three plus `golangci-lint` and a benchmark smoke test on
+every PR. `-race` is not optional here: every bug this repo has actually
+had was a concurrency bug that only fails under contention.
 
 ---
 

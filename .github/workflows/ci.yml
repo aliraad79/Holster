@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Tidy check
+        run: |
+          go mod tidy
+          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+            echo "::error::go.mod / go.sum are not tidy. Run 'go mod tidy' and commit."
+            git diff -- go.mod go.sum
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # -race matters more here than in most repos: this is a ledger, and
+      # the bugs that have actually shown up were concurrency bugs (a
+      # shard-lock deadlock and a hold double-spend), both caught by tests
+      # that only fail under contention.
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      - name: Benchmark smoke
+        run: go test -run='^$' -bench=. -benchtime=10x ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          # Pinned deliberately: `version: latest` lets CI behavior change
+          # with no commit, and golangci-lint v2 changed the config schema
+          # (.golangci.yml here is v1 format).
+          version: v1.64.8
+          args: --timeout=5m

@@ -1,0 +1,37 @@
+run:
+  timeout: 5m
+  tests: true
+
+# NOTE: this is golangci-lint v1 config schema. The CI workflow pins
+# v1.64.8 (the last v1 release) to match. v2 moved formatters into their
+# own section and merged gosimple into staticcheck, so this file will not
+# parse under v2 — migrating is a deliberate change, not something to
+# inherit by letting CI float to `latest`.
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - copyloopvar
+    - gocritic
+    - misspell
+    # gofmt was missing for a long time, so `golangci-lint` passed happily
+    # on unformatted code and 8 files had drifted out of shape.
+    - gofmt
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - performance
+    disabled-checks:
+      - paramTypeCombine
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
