@@ -42,8 +42,11 @@ jobs:
       - name: Test (race)
         run: go test -race -count=1 ./...
 
+      # -timeout is load-bearing, not boilerplate: BenchmarkEndToEnd
+      # deadlocked on a defer-ordering bug and would have hung this job
+      # until the Actions limit rather than failing.
       - name: Benchmark smoke
-        run: go test -run='^$' -bench=. -benchtime=10x ./...
+        run: go test -run='^$' -bench=. -benchtime=10x -timeout 5m ./...
 
   lint:
     name: golangci-lint

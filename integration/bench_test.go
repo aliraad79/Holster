@@ -157,13 +157,24 @@ func BenchmarkClearing_SettleThroughput(b *testing.B) {
 	_ = wRisk // unused but kept symmetric with the production wiring
 }
 
-// BenchmarkEndToEnd is the headline number: the full Risk.Submit
-// pipeline including hold + WAL fsync. Group commit + per-user
-// sharding should keep us above 1M ops/sec/core.
+// BenchmarkEndToEnd_GunPlusHolster measures a full order round trip:
+// Risk.Submit (hold + durable WAL append), the Gun matching engine, and
+// the clearing settlement the resulting fill triggers.
 //
-// (Settle path uses a separate WAL; this bench focuses on the
-// submit/hold leg which is the producer-facing latency the system has
-// to advertise.)
+// This benchmark used to deadlock and therefore had never produced a
+// number -- note its absence from bench/phase-5-final.txt. `defer cancel()`
+// was registered before `defer wg.Wait()`, and defers run LIFO, so Wait
+// ran first and blocked forever on market goroutines that had not been
+// told to stop. Keep the cancel-then-wait ordering in one defer so the
+// two cannot be separated again.
+//
+// It also used to stop the clock straight after the submit loop. Since
+// reg.Submit only enqueues onto the market's inbox channel, that timed the
+// enqueue and not the matching or settlement it causes. The loop now waits
+// for every fill to settle before stopping the timer, so the reported
+// figure covers the whole pipeline. That makes the number much larger than
+// the old intent of ">1M ops/sec/core" -- it is bounded by two synchronous
+// fsyncs per order, which is what the pipeline actually costs.
 func BenchmarkEndToEnd_GunPlusHolster(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping E2E bench under -short")
@@ -173,28 +184,30 @@ func BenchmarkEndToEnd_GunPlusHolster(b *testing.B) {
 	dir := b.TempDir()
 	l := ledger.New()
 
-	wRisk, err := wal.Open(filepath.Join(dir, "risk.wal"), wal.Options{
-		MaxBatch: 256, MaxLatency: 200 * time.Microsecond, FsyncOnFlush: true,
+	// One shared WAL: that is the production shape, since recovery replays
+	// a single ordered stream (see the recovery package). Two WALs would
+	// also understate cost by giving each service its own flusher.
+	w, err := wal.Open(filepath.Join(dir, "holster.wal"), wal.Options{
+		MaxBatch: 256, FsyncOnFlush: true,
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer wRisk.Close()
+	defer w.Close()
 
-	wClr, err := wal.Open(filepath.Join(dir, "clr.wal"), wal.Options{
-		MaxBatch: 256, MaxLatency: 200 * time.Microsecond, FsyncOnFlush: true,
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer wClr.Close()
+	r := risk.New(l, w)
+	c := clearing.New(l, w, l)
 
-	r := risk.New(l, wRisk)
-	c := clearing.New(l, wClr, l)
+	var settled atomic.Int64
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
+	// Cancel BEFORE waiting, in one defer. Two separate defers run LIFO and
+	// deadlocked this benchmark for its entire existence.
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
 	reg := market.NewRegistry(ctx, &wg, market.Options{
 		InboxSize: 4096,
@@ -202,10 +215,10 @@ func BenchmarkEndToEnd_GunPlusHolster(b *testing.B) {
 		OnMatch: func(symbol string, matches []models.Match) {
 			for _, m := range matches {
 				_ = c.Settle(symbol, m)
+				settled.Add(1)
 			}
 		},
 	})
-	defer wg.Wait()
 
 	// Fund users.
 	const users = 256
@@ -229,6 +242,10 @@ func BenchmarkEndToEnd_GunPlusHolster(b *testing.B) {
 	}
 	reg.Submit(seed)
 
+	// Every buy crosses the resting sell, so each order should produce
+	// exactly one fill and therefore one settlement.
+	settled.Store(0)
+
 	b.ResetTimer()
 	var nextID int64 = 1_000_000
 	for i := 0; i < b.N; i++ {
@@ -243,6 +260,16 @@ func BenchmarkEndToEnd_GunPlusHolster(b *testing.B) {
 			b.Fatal(err)
 		}
 		reg.Submit(ord)
+	}
+
+	// Drain: reg.Submit is an async channel send, so without this the
+	// benchmark reports the cost of enqueuing rather than of trading.
+	deadline := time.Now().Add(2 * time.Minute)
+	for settled.Load() < int64(b.N) {
+		if time.Now().After(deadline) {
+			b.Fatalf("timed out draining: %d of %d fills settled", settled.Load(), b.N)
+		}
+		time.Sleep(200 * time.Microsecond)
 	}
 	b.StopTimer()
 }
