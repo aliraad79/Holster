@@ -218,7 +218,8 @@ func (p *Persister) commit(ctx context.Context, entries []Entry, trades []TradeR
 		ON CONFLICT (engine_seq, symbol, user_id, asset)
 		    WHERE engine_seq IS NOT NULL DO NOTHING
 	`
-	for _, e := range entries {
+	for i := range entries {
+		e := &entries[i]
 		if _, err := tx.ExecContext(ctx, insertEntry,
 			e.UserID, e.Asset, qtyStr(e.Delta), qtyStr(e.HeldDelta),
 			e.Kind, nullStr(e.RefKind), e.RefID, nullableUint64(e.EngineSeq),

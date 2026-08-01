@@ -93,7 +93,7 @@ func New() *Ledger {
 // ledger that already reflects it double-applies every record, and
 // SettleFill in particular is not idempotent.
 func (l *Ledger) IsEmpty() bool {
-	for _, s := range l.shards {
+	for _, s := range &l.shards {
 		s.mu.RLock()
 		n := len(s.accounts)
 		s.mu.RUnlock()
@@ -101,7 +101,7 @@ func (l *Ledger) IsEmpty() bool {
 			return false
 		}
 	}
-	for _, hs := range l.holdShards {
+	for _, hs := range &l.holdShards {
 		hs.mu.RLock()
 		n := len(hs.holds)
 		hs.mu.RUnlock()

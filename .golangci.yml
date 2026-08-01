@@ -29,6 +29,11 @@ linters-settings:
       - performance
     disabled-checks:
       - paramTypeCombine
+      # Mirrors Gun's config. Order/Entry are passed by value on purpose
+      # so the callee cannot mutate the caller's copy; swapping the hot
+      # path to pointers is a design change, not a lint fix. Re-enable
+      # when a benchmark says the copies cost more than that guarantee.
+      - hugeParam
 
 issues:
   exclude-rules:
