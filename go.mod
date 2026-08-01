@@ -3,7 +3,7 @@ module github.com/aliraad79/Holster
 go 1.25.0
 
 require (
-	github.com/aliraad79/Gun v0.0.0-20260730160432-5d95b1d0b1b4
+	github.com/aliraad79/Gun v0.0.0-20260801085517-f49ae6a4ff7f
 	github.com/stretchr/testify v1.11.1
 )
 
